@@ -13,7 +13,7 @@ import (
 
 func main() {
 	kubeconfig := flag.String("kubeconfig", "C:\\Users\\utsab\\.kube\\config", "location to your kubeconfig file")
-	flag.Parse()
+	// flag.Parse()
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
 		fmt.Printf("error %s, building config from flags\n", err.Error())

@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appinformers "k8s.io/client-go/informers/apps/v1"
@@ -78,6 +79,7 @@ func (c *controller) processItem() bool {
 	}
 
 	// when synced , we do not want to process that item once again
+	// once in queue and executed, remove or forget that item from the queue.
 	defer c.queue.Forget(item)
 
 	// if the shutdown is false then we get the object from the queue
@@ -91,6 +93,61 @@ func (c *controller) processItem() bool {
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		fmt.Printf("error %s, splitting key into namespace and name\n", err.Error())
+		return false
+	}
+
+	// check if the object has been deleted from k8s cluster
+	// It is safer to query API server directly rather than using
+	// liters, as cache may not have the deployment in some cases.
+	ctx := context.Background()
+	_, err = c.clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+	// this error says that deployment is not present, hence it is deleted.
+	// we can use apimachinery errors to get if deployment is not found error.
+	if apierrors.IsNotFound(err) {
+		fmt.Printf("handle delete event for deployment %s\n", name)
+
+		// delete services with particular label (label provided by the controller to resources)s
+		labelSelector := fmt.Sprintf("created-by=expose-controller,deployment=%s", name)
+
+		// ****************service deletion********************
+		// list the service with the particular label.
+		svcList, err := c.clientset.CoreV1().Services(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+
+		if err != nil {
+			fmt.Printf("error %s, listing services\n", err.Error())
+			return false
+		}
+
+		// delete service
+		for _, svc := range svcList.Items {
+			err = c.clientset.CoreV1().Services(ns).Delete(ctx, svc.Name, metav1.DeleteOptions{})
+			if err != nil {
+				fmt.Printf("error %s, deleting service %s\n", err.Error(), svc.Name)
+			}
+		}
+
+		// *************** ingress deletion ***************
+		// list all the ingress in the particular label
+		ingList, err := c.clientset.NetworkingV1().Ingresses(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			fmt.Printf("error %s, listing ingresses\n", err.Error())
+			return false
+		}
+
+		// delete ingress
+		for _, ing := range ingList.Items {
+			err = c.clientset.NetworkingV1().Ingresses(ns).Delete(ctx, ing.Name, metav1.DeleteOptions{})
+			if err != nil {
+				fmt.Printf("error %s, deleting ingress %s\n", err.Error(), ing.Name)
+				return false
+			}
+		}
+
+		return true
 	}
 
 	err = c.syncDeployment(ns, name)
@@ -100,7 +157,7 @@ func (c *controller) processItem() bool {
 		return false
 	}
 
-	return false
+	return true
 }
 
 func (c *controller) syncDeployment(ns, name string) error {
@@ -112,6 +169,11 @@ func (c *controller) syncDeployment(ns, name string) error {
 		fmt.Printf("error %s, getting deployment from lister\n", err.Error())
 	}
 
+	labels := map[string]string{
+		"created-by": "expose-controller",
+		"deployment": name,
+	}
+
 	// create service
 	// we have to modify this, to figure out the port
 	// our deployment's container is listening on
@@ -119,6 +181,7 @@ func (c *controller) syncDeployment(ns, name string) error {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      dep.Name,
 			Namespace: ns,
+			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
 			// get label for deployment to use as selector is service
@@ -145,6 +208,10 @@ func createIngress(ctx context.Context, client kubernetes.Interface, svc *corev1
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      svc.Name,
 			Namespace: svc.Namespace,
+			Labels: map[string]string{
+				"created-by": "expose-controller",
+				"deployment": svc.Name,
+			},
 			Annotations: map[string]string{
 				"nginx.ingress.kubernetes.io/rewrite-target": "/",
 			},
